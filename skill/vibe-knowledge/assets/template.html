@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700;900&family=Noto+Serif+SC:wght@700;900&family=Cormorant+Garamond:ital,wght@0,500;1,500&display=block" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: "Noto Sans SC", "Microsoft YaHei", sans-serif; color: #f3ecdf; }
+  #c { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(100vw, 177.78vh); aspect-ratio: 16 / 9; background: #06070c; }
+  #panel { position: absolute; inset: 0; z-index: 5; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+           background: radial-gradient(circle at center, rgba(6,7,12,.55), rgba(6,7,12,.96)); backdrop-filter: blur(6px); transition: opacity .6s; }
+  #panel.hide { opacity: 0; pointer-events: none; }
+  #panel h1 { margin: 0; font-family: "Noto Serif SC", serif; font-size: 64px; letter-spacing: 16px; color: #ffcf6e; text-shadow: 0 0 40px rgba(255,207,110,.4); padding-left: 16px; }
+  #panel p { margin: 0 0 30px; letter-spacing: 6px; color: #9aa0b4; }
+  #panel button { font: inherit; letter-spacing: 4px; padding: 14px 40px; border-radius: 40px; border: 1px solid rgba(255,207,110,.5); background: transparent; color: #ffcf6e; cursor: pointer; min-width: 280px; }
+  #panel button:hover { background: rgba(255,207,110,.12); }
+  #panel button:disabled { opacity: .4; cursor: default; }
+  #status { font-size: 13px; color: #6f7590; letter-spacing: 2px; min-height: 1.4em; text-align: center; max-width: 80vw; }
+  #keys { position: absolute; bottom: 24px; font-size: 12px; color: #4d5268; letter-spacing: 2px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel">
+  <h1>__TITLE__</h1>
+  <p>__SUBTITLE__</p>
+  <button id="play" disabled>加载中…</button>
+  <button id="export" disabled>导出 MP4</button>
+  <div id="status"></div>
+  <div id="keys">空格 播放/暂停 · ← → 快退/快进 5 秒 · F 全屏 · Esc 回到面板</div>
+</div>
+<audio id="bgm" src="bgm.mp4" preload="auto"></audio>
+
+<script>
+// ============================================================
+//  Vibe 知识大赏 · 引擎模板
+//  所有画面都是 render(t) 的纯函数：播放时 t = audio.currentTime，导出时逐帧步进。
+//  逻辑坐标恒为 1920×1080；预览按 1x 画，导出按 EXPORT_SCALE 倍超采样（2 = 4K）。
+// ============================================================
+const CONFIG = {
+  title: '__TITLE__',          // 中文片名（片尾 / 面板）
+  titleEn: '__TITLE_EN__',     // 英文片名（片尾高级感）
+  tagline: '__TAGLINE__',      // 片尾英文斜体一句话（科普类结尾用）
+  dur: 24,                     // 视频总长（秒），按 BGM 有效长度设
+  exportFps: 60,               // 抖音上限 60
+  exportScale: 2,              // 2 → 3840×2160（4K）
+  ending: 'choice',            // 'choice'（情感类：二选一） | 'title'（科普类：片名 + 英文）
+};
+const W = 1920, H = 1080, DUR = CONFIG.dur;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let SS = 1; // 当前超采样倍数
+function setScale(s) { SS = s; canvas.width = W * s; canvas.height = H * s; }
+setScale(1);
+
+const SANS = '"Noto Sans SC","Source Han Sans SC","Microsoft YaHei","PingFang SC",sans-serif';
+const SERIF = '"Noto Serif SC","Source Han Serif SC","Songti SC","Microsoft YaHei",serif';
+const EN = '"Cormorant Garamond","Times New Roman",serif';
+const COL = {
+  gold: [255, 207, 110], rose: [255, 93, 122], ice: [127, 179, 255],
+  slate: [74, 82, 104], text: [243, 236, 223], dim: [138, 143, 163], white: [255, 255, 255],
+};
+const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+
+// ---------- 数学 ----------
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const E = {
+  out3: x => 1 - Math.pow(1 - x, 3), in3: x => x * x * x,
+  io3: x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2,
+  outBack: x => { const c1 = 1.9, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); },
+  outExpo: x => x >= 1 ? 1 : 1 - Math.pow(2, -10 * x), inExpo: x => x <= 0 ? 0 : Math.pow(2, 10 * x - 10),
+};
+const hash = n => { const x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }; // 确定性随机：同一帧永远一样
+const win = (t, a, b, fi = .35, fo = .35) => Math.min(seg(t, a, a + fi), 1 - seg(t, b - fo, b));
+
+// ---------- 音频包络：画面随音乐呼吸 ----------
+let AB = null, ENV = new Float32Array(1), KICK = new Float32Array(1);
+const ENV_HZ = 100;
+function buildEnvelope(ab) {
+  const d = ab.getChannelData(0), hop = Math.floor(ab.sampleRate / ENV_HZ), n = Math.floor(d.length / hop), e = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let s = 0; for (let j = 0; j < hop; j++) s += Math.abs(d[i * hop + j]); e[i] = s / hop; }
+  const p98 = Array.from(e).sort((a, b) => a - b)[Math.floor(n * .98)] || 1;
+  ENV = new Float32Array(n); KICK = new Float32Array(n);
+  const flux = new Float32Array(n); let sm = 0;
+  for (let i = 0; i < n; i++) { sm = sm * .9 + (e[i] / p98) * .1; ENV[i] = clamp(sm); flux[i] = Math.max(0, e[i] - (e[i - 2] || 0)); }
+  const fmax = Array.from(flux).sort((a, b) => a - b)[Math.floor(n * .995)] || 1;
+  let k = 0; for (let i = 0; i < n; i++) { k = Math.max(clamp(flux[i] / fmax), k * .9); KICK[i] = k; }
+}
+const env = t => ENV[clamp(Math.floor(t * ENV_HZ), 0, ENV.length - 1)] || 0;
+const kick = t => KICK[clamp(Math.floor(t * ENV_HZ), 0, KICK.length - 1)] || 0;
+
+// ---------- 绘图工具 ----------
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+function heartPath(x, y, s) {
+  ctx.beginPath(); ctx.moveTo(x, y + .9 * s);
+  ctx.bezierCurveTo(x - 1.6 * s, y - .1 * s, x - .9 * s, y - 1.25 * s, x, y - .45 * s);
+  ctx.bezierCurveTo(x + .9 * s, y - 1.25 * s, x + 1.6 * s, y - .1 * s, x, y + .9 * s); ctx.closePath();
+}
+function glowText(txt, x, y, font, color, glow = 0, align = 'center', alpha = 1) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.font = font; ctx.textAlign = align; ctx.textBaseline = 'middle';
+  if (glow > 0) { ctx.shadowColor = color; ctx.shadowBlur = glow * SS; }
+  ctx.fillStyle = color; ctx.fillText(txt, x, y); ctx.restore();
+}
+// 逐字距排版（英文大写 + 宽字距 = 高级感）
+function spacedText(txt, x, y, font, color, spacing, alpha = 1, glow = 0) {
+  if (alpha <= 0) return;
+  ctx.save(); ctx.globalAlpha *= alpha; ctx.font = font; ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.fillStyle = color;
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow * SS; }
+  const chars = [...txt], ws = chars.map(c => ctx.measureText(c).width), tw = ws.reduce((a, b) => a + b, 0) + spacing * (chars.length - 1);
+  let cx = x - tw / 2; chars.forEach((c, i) => { ctx.fillText(c, cx, y); cx += ws[i] + spacing; }); ctx.restore();
+}
+function ring(x, y, t, t0, dur, r0, r1, c, w = 4) {
+  const p = seg(t, t0, t0 + dur); if (p <= 0 || p >= 1) return;
+  ctx.save(); ctx.strokeStyle = rgba(c, (1 - p) * .8); ctx.lineWidth = w * (1 - p) + .5;
+  ctx.beginPath(); ctx.arc(x, y, lerp(r0, r1, E.out3(p)), 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+}
+function burst(x, y, t, t0, n, seed, cols, spd = 420, life = 1.3) {
+  const p = (t - t0) / life; if (p <= 0 || p >= 1) return;
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < n; i++) {
+    const a = hash(seed + i) * Math.PI * 2, v = spd * (.35 + hash(seed + i * 7.3) * .9), d = v * E.out3(p) * life * .8;
+    ctx.fillStyle = rgba(cols[i % cols.length], (1 - p) * .9); ctx.beginPath();
+    ctx.arc(x + Math.cos(a) * d, y + Math.sin(a) * d + 120 * p * p, (2 + hash(seed + i * 3.1) * 5) * (1 - p * .6), 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+function flash(alpha, c = [255, 240, 210]) { if (alpha <= 0) return; ctx.fillStyle = rgba(c, alpha); ctx.fillRect(0, 0, W, H); }
+// 推镜：以 (fx,fy) 为焦点放大 s 倍，centerP 把焦点同时拉到画面中央。转场 = 推进到细节 → 细节铺满 → 下一场从同色/同形展开
+function zoomTo(fx, fy, s, centerP) { ctx.translate(lerp(fx, W / 2, centerP), lerp(fy, H / 2, centerP)); ctx.scale(s, s); ctx.translate(-fx, -fy); }
+
+// ---------- 背景 / 暗角 / 胶片颗粒 ----------
+const vignette = document.createElement('canvas'); vignette.width = W; vignette.height = H;
+{ const g = vignette.getContext('2d'), gr = g.createRadialGradient(W / 2, H / 2, H * .3, W / 2, H / 2, W * .62);
+  gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.72)'); g.fillStyle = gr; g.fillRect(0, 0, W, H); }
+const grainTiles = [];
+for (let k = 0; k < 4; k++) {
+  const c = document.createElement('canvas'); c.width = c.height = 256; const g = c.getContext('2d'), im = g.createImageData(256, 256);
+  for (let i = 0; i < im.data.length; i += 4) { const v = hash(i * .37 + k * 91.7) * 255; im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 20; }
+  g.putImageData(im, 0, 0); grainTiles.push(c);
+}
+const STARS = Array.from({ length: 160 }, (_, i) => ({ x: hash(i) * W, y: hash(i + 500) * H, r: .6 + hash(i + 900) * 1.8, s: .2 + hash(i + 1300) }));
+// 每段的背景色调：[时间, 主色, 副色]，段与段之间自动渐变
+const TINTS = [
+  [0, [255, 93, 122], [120, 80, 200]],
+  [8, [60, 110, 220], [255, 207, 110]],
+  [DUR, [255, 207, 110], [255, 93, 122]],
+];
+function tintAt(t) {
+  for (let i = 0; i < TINTS.length - 1; i++) if (t < TINTS[i + 1][0]) {
+    const p = E.io3(seg(t, TINTS[i][0], Math.min(TINTS[i + 1][0], TINTS[i][0] + 1.5)));
+    const prev = i > 0 ? TINTS[i - 1] : TINTS[i];
+    return [mix(prev[1], TINTS[i][1], p), mix(prev[2], TINTS[i][2], p)];
+  }
+  const l = TINTS[TINTS.length - 1]; return [l[1], l[2]];
+}
+function drawBackground(t) {
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#0a0c14'); g.addColorStop(1, '#05060a');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const [c1, c2] = tintAt(t), e = env(t), k = kick(t);
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const [c, bx, by, br, ph] of [[c1, .22, .3, 900, 0], [c2, .8, .7, 950, 2.1], [c1, .6, .1, 700, 4.2]]) {
+    const x = W * bx + Math.sin(t * .13 + ph) * 160, y = H * by + Math.cos(t * .11 + ph) * 120;
+    const gr = ctx.createRadialGradient(x, y, 0, x, y, br * (1 + k * .06));
+    gr.addColorStop(0, rgba(c, .085 + e * .05 + k * .03)); gr.addColorStop(1, rgba(c, 0)); ctx.fillStyle = gr; ctx.fillRect(0, 0, W, H);
+  }
+  for (const s of STARS) {
+    ctx.fillStyle = `rgba(255,240,220,${(.12 + .25 * s.s) * (.7 + .3 * Math.sin(t * 2 + s.x))})`;
+    ctx.beginPath(); ctx.arc(s.x, (s.y - t * 8 * s.s + H * 10) % H, s.r, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawPost(t) {
+  ctx.drawImage(vignette, 0, 0, W, H);
+  const f = Math.floor(t * 24), ox = (hash(f) * 256) | 0, oy = (hash(f + 3) * 256) | 0, tile = grainTiles[f % 4];
+  for (let y = -oy; y < H; y += 256) for (let x = -ox; x < W; x += 256) ctx.drawImage(tile, x, y);
+}
+
+// ============================================================
+//  字幕：逐字浮现，{金色高亮} [玫红高亮]，\n 换行
+// ============================================================
+const CAPS = [
+  [0.4, 3.8, '第一句一定和观众有关：{你}…'],
+  [3.9, 7.8, '关键词用金色，[情绪词]用玫红'],
+  [8.6, 12.4, '每句 3～4 秒，切在小节线上'],
+  [12.5, 16.4, '两行字幕\n第二行放{结论}'],
+].map(([a, b, s]) => ({ a, b, lines: parseCap(s) }));
+function parseCap(s) {
+  const lines = [[]]; let hl = 0;
+  for (const ch of s) {
+    if (ch === '{') { hl = 1; continue; } if (ch === '}' || ch === ']') { hl = 0; continue; }
+    if (ch === '[') { hl = 2; continue; } if (ch === '\n') { lines.push([]); continue; }
+    lines[lines.length - 1].push({ ch, hl });
+  }
+  return lines;
+}
+const CAP_Y = 975, CAP_FS = 54, CAP_MAXW = 1500;
+function drawCaptions(t) {
+  for (const c of CAPS) {
+    if (t < c.a || t > c.b) continue;
+    const vis = win(t, c.a, c.b, .3, .25);
+    ctx.save();
+    const gr = ctx.createRadialGradient(W / 2, CAP_Y + 30, 0, W / 2, CAP_Y + 30, 620);
+    gr.addColorStop(0, `rgba(5,6,10,${.6 * vis})`); gr.addColorStop(1, 'rgba(5,6,10,0)'); ctx.fillStyle = gr; ctx.fillRect(0, CAP_Y - 300, W, 420);
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.font = `700 ${CAP_FS}px ${SANS}`;
+    let maxw = 0; for (const ln of c.lines) maxw = Math.max(maxw, ln.reduce((s, o) => s + ctx.measureText(o.ch).width, 0));
+    const fs = Math.min(CAP_FS, CAP_FS * CAP_MAXW / maxw), lh = fs * 1.5; ctx.font = `700 ${fs}px ${SANS}`;
+    const y0 = CAP_Y - (c.lines.length - 1) * lh / 2, exit = seg(t, c.b - .25, c.b), k = kick(t);
+    let idx = 0;
+    c.lines.forEach((ln, li) => {
+      const ws = ln.map(o => ctx.measureText(o.ch).width); let x = W / 2 - ws.reduce((a, b) => a + b, 0) / 2;
+      ln.forEach((o, i) => {
+        const tc = c.a + idx * .028, p = E.out3(seg(t, tc, tc + .4)); idx++;
+        const a = p * (1 - exit);
+        if (a > 0) {
+          ctx.globalAlpha = a;
+          if (o.hl) { const cc = o.hl === 1 ? COL.gold : COL.rose; ctx.shadowColor = rgba(cc, .9); ctx.shadowBlur = (18 + 22 * k) * SS; ctx.fillStyle = rgba(cc); }
+          else { ctx.shadowColor = 'rgba(0,0,0,.6)'; ctx.shadowBlur = 12 * SS; ctx.fillStyle = rgba(COL.text); }
+          ctx.fillText(o.ch, x, y0 + li * lh + (1 - p) * 28 - exit * 16);
+        }
+        x += ws[i];
+      });
+    });
+    ctx.restore();
+  }
+}
+// 章节小标签（左上角，可选）。注意：不要做顶部进度条 / 常驻片名，会破坏观感
+const LABELS = [[8.2, 16.6, '01', '章节名']];
+function drawLabels(t) {
+  for (const [s, e, num, title] of LABELS) {
+    const v = win(t, s, e, .5, .4); if (v <= 0) continue;
+    ctx.save(); ctx.globalAlpha = v; const dx = (1 - E.out3(seg(t, s, s + .6))) * -40;
+    glowText(num, 70 + dx, 70, `900 40px ${SANS}`, rgba(COL.gold), 16, 'left');
+    ctx.fillStyle = rgba(COL.gold, .6); ctx.fillRect(130 + dx, 68, 60 * E.out3(seg(t, s + .1, s + .7)), 2);
+    glowText(title, 208 + dx, 70, `700 36px ${SANS}`, rgba(COL.text, .9), 0, 'left');
+    ctx.restore();
+  }
+}
+
+// ============================================================
+//  示例场景（替换成你的分镜）
+// ============================================================
+// 场景 1：开场视觉锚点 —— 一个和主题强相关的「物件」，第一秒就要有动作
+function sceneHook(t) {
+  const enter = E.outBack(seg(t, 0, 1.1)), zp = seg(t, 6.6, 8.0), zs = Math.pow(60, E.in3(zp));
+  ring(W / 2, H / 2 - 60, t, .05, 1.4, 80, 900, COL.rose, 6);
+  ring(W / 2, H / 2 - 60, t, .3, 1.6, 80, 1100, COL.gold, 3);
+  ctx.save(); zoomTo(W / 2, H / 2 - 60, zs, E.io3(zp));
+  ctx.translate(W / 2, H / 2 - 60); ctx.scale(enter, enter); ctx.rotate((1 - enter) * -.4 + Math.sin(t * .8) * .05);
+  const r = 150 * (1 + kick(t) * .08), g = ctx.createRadialGradient(-40, -40, 10, 0, 0, r);
+  g.addColorStop(0, rgba(COL.gold)); g.addColorStop(1, rgba(COL.rose));
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fillStyle = g; ctx.shadowColor = rgba(COL.rose); ctx.shadowBlur = 60 * SS; ctx.fill(); ctx.shadowBlur = 0;
+  glowText('?', 0, 6, `900 160px ${SANS}`, '#fff', 0, 'center', 1 - seg(t, 7.0, 7.4));
+  ctx.restore();
+}
+// 场景 2：从上一场的颜色里「展开」出来的数据画面
+function sceneBody(t) {
+  const ip = seg(t, 8.0, 8.5);
+  for (let i = 0; i < 10; i++) {
+    const x = W / 2 + (i - 4.5) * 120, rise = E.outBack(seg(t, 8.0 + i * .05, 8.7 + i * .05)), h = (.3 + hash(i * 3.3) * .6) * 480 * rise;
+    const g = ctx.createLinearGradient(0, 780 - h, 0, 780); g.addColorStop(0, rgba(i === 6 ? COL.gold : COL.ice, .95)); g.addColorStop(1, rgba(COL.ice, .1));
+    rr(x - 32, 780 - h, 64, h, 14); ctx.fillStyle = g; ctx.fill();
+  }
+  if (ip < 1) {
+    ctx.save(); ctx.globalAlpha = 1 - E.out3(ip);
+    const g = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, 1300); g.addColorStop(0, rgba(COL.gold)); g.addColorStop(1, rgba(COL.rose));
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); ctx.restore();
+  }
+  ring(W / 2, H / 2, t, 8.0, 1.2, 50, 1200, COL.white, 8);
+}
+
+// ============================================================
+//  结尾组件（二选一）
+// ============================================================
+// A. 二选一（情感类）：丝滑地在两个选项间来回切换，最后几秒可无缝循环 → 适合观众录屏做实况
+function endingChoice(t, o) {
+  const t0 = o.t0, inP = E.out3(seg(t, t0, t0 + .9));
+  // 选择器：停留 → 滑动 → 停留 → 滑回，周期 o.period，可整段循环
+  const u = ((t - t0 - 1.0) / o.period % 1 + 1) % 1;
+  let sel = 0;
+  if (t > t0 + 1.0) sel = u < .5 ? E.io3(seg(u, .0, .16)) : 1 - E.io3(seg(u, .5, .66));
+  const glide = Math.sin(Math.PI * sel);                     // 滑动途中拉伸（squash & stretch）
+  const xA = W / 2 - 380, xB = W / 2 + 380, y = H / 2 + 40;
+  const cA = o.colA || COL.rose, cB = o.colB || COL.ice, cS = mix(cA, cB, sel);
+  // 背景随选择变色
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  const bx = lerp(xA, xB, sel), bg = ctx.createRadialGradient(bx, y, 0, bx, y, 900);
+  bg.addColorStop(0, rgba(cS, .22 * inP)); bg.addColorStop(1, rgba(cS, 0)); ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  // 粒子被选中的一侧吸引
+  for (let i = 0; i < 90; i++) {
+    const a = hash(i) * 7 + t * (.2 + hash(i + 9) * .3), rad = 120 + hash(i + 3) * 420;
+    const px = lerp(xA, xB, sel) + Math.cos(a) * rad * 1.3, py = y + Math.sin(a) * rad * .6;
+    ctx.fillStyle = rgba(cS, (.15 + hash(i + 7) * .35) * inP); ctx.beginPath(); ctx.arc(px, py, 1.5 + hash(i + 5) * 3, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+  // 问题
+  ctx.save(); ctx.globalAlpha = inP;
+  glowText(o.q, W / 2, 250 - (1 - inP) * 30, `900 72px ${SANS}`, rgba(COL.text), 8);
+  if (o.qEn) spacedText(o.qEn.toUpperCase(), W / 2, 330, `500 30px ${EN}`, rgba(COL.dim), 10, inP);
+  // 高亮胶囊
+  const pw = 520 * (1 + glide * .28), ph = 230 * (1 - glide * .1), px = lerp(xA, xB, E.io3(sel));
+  rr(px - pw / 2, y - ph / 2, pw, ph, ph / 2); ctx.fillStyle = rgba(cS, .16); ctx.fill();
+  ctx.strokeStyle = rgba(cS, .9); ctx.lineWidth = 3; ctx.shadowColor = rgba(cS); ctx.shadowBlur = (30 + 30 * kick(t)) * SS; ctx.stroke(); ctx.shadowBlur = 0;
+  // 两个选项
+  [[o.A, o.Aen, xA, 1 - sel, cA], [o.B, o.Ben, xB, sel, cB]].forEach(([txt, en, x, on, c]) => {
+    const s = .86 + .2 * E.out3(on);
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.globalAlpha = inP * (.4 + .6 * on);
+    glowText(txt, 0, -18, `900 92px ${SANS}`, rgba(mix(COL.text, c, on * .45)), 14 * on);
+    if (en) spacedText(en.toUpperCase(), 0, 58, `500 30px ${EN}`, rgba(c, .9), 8, 1);
+    ctx.restore();
+  });
+  ctx.restore();
+}
+// B. 片名 + 英文（科普类）：不要「评论区见」，用英文和留白营造高级感
+function endingTitle(t, o) {
+  const t0 = o.t0, a = seg(t, t0, t0 + .8);
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 120; i++) {
+    const x = hash(i * 1.3) * W + Math.sin(t * .4 + i) * 40, y = ((hash(i * 2.7) * H - t * (16 + hash(i) * 30)) % H + H) % H;
+    ctx.fillStyle = rgba(i % 4 ? COL.gold : COL.rose, (.08 + hash(i * 9) * .35) * a); ctx.beginPath(); ctx.arc(x, y, 1 + hash(i * 5) * 2.5, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+  const chars = [...o.zh];
+  ctx.save(); ctx.font = `900 150px ${SERIF}`; ctx.textBaseline = 'middle';
+  const ws = chars.map(ch => ctx.measureText(ch).width + 24), tw = ws.reduce((x, y) => x + y, 0) - 24;
+  let x = W / 2 - tw / 2;
+  chars.forEach((ch, i) => {
+    const p = E.out3(seg(t, t0 + .2 + i * .12, t0 + .9 + i * .12));
+    ctx.globalAlpha = p; ctx.fillStyle = rgba(COL.gold); ctx.shadowColor = rgba(COL.gold); ctx.shadowBlur = (40 + 30 * kick(t)) * SS;
+    ctx.fillText(ch, x, 430 + (1 - p) * 40); x += ws[i];
+  });
+  ctx.restore();
+  const lp = E.io3(seg(t, t0 + 1.0, t0 + 1.9));
+  ctx.fillStyle = rgba(COL.gold, .55); ctx.fillRect(W / 2 - 300 * lp, 548, 600 * lp, 1.5);
+  // 英文：字距从宽收紧，慢慢浮现
+  const ep = E.out3(seg(t, t0 + 1.3, t0 + 2.8));
+  spacedText(o.en.toUpperCase(), W / 2, 612, `500 46px ${EN}`, rgba(COL.text), lerp(40, 16, ep), ep);
+  if (o.tagline) {
+    const tp = seg(t, t0 + 2.4, t0 + 3.2);
+    ctx.save(); ctx.globalAlpha = tp; ctx.font = `italic 500 34px ${EN}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = rgba(COL.dim); ctx.fillText(o.tagline, W / 2, 690); ctx.restore();
+  }
+}
+
+// ============================================================
+//  主渲染：按时间段分派场景
+// ============================================================
+const ENDING_T0 = 16.6;
+const ENDING = new URLSearchParams(location.search).get('ending') || CONFIG.ending;
+function render(t) {
+  ctx.setTransform(SS, 0, 0, SS, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  drawBackground(t);
+  if (t < 8.0) sceneHook(t);
+  else if (t < ENDING_T0 + .6) sceneBody(t);
+  if (t > ENDING_T0) {
+    ctx.save(); ctx.globalAlpha = seg(t, ENDING_T0, ENDING_T0 + .6);
+    if (ENDING === 'title') endingTitle(t, { t0: ENDING_T0, zh: CONFIG.title, en: CONFIG.titleEn, tagline: CONFIG.tagline });
+    else endingChoice(t, { t0: ENDING_T0, period: 2.4, q: '下一个人，比之前所有人都好', qEn: 'Would you stop here?', A: '停下', Aen: 'Stop', B: '再等等', Ben: 'Keep looking' });
+    ctx.restore();
+  }
+  drawPost(t);
+  drawCaptions(t);
+  drawLabels(t);
+  flash(seg(t, DUR - 1.2, DUR), [0, 0, 0]);
+}
+
+// ============================================================
+//  播放控制
+// ============================================================
+const bgm = document.getElementById('bgm'), panel = document.getElementById('panel');
+const playBtn = document.getElementById('play'), expBtn = document.getElementById('export'), statusEl = document.getElementById('status');
+const qs = new URLSearchParams(location.search);
+let manualT = parseFloat(qs.get('t') || '0'), exporting = false;
+function loop() {
+  if (!exporting) {
+    const t = bgm.paused ? manualT : bgm.currentTime;
+    if (!bgm.paused && t >= DUR) { bgm.pause(); manualT = DUR; panel.classList.remove('hide'); }
+    if (!bgm.paused) bgm.volume = 1 - seg(t, DUR - 2, DUR) * .9;
+    render(Math.min(t, DUR));
+  }
+  requestAnimationFrame(loop);
+}
+function play() { bgm.currentTime = manualT; bgm.play(); panel.classList.add('hide'); }
+playBtn.onclick = () => { if (manualT >= DUR - .5) manualT = 0; play(); };
+document.addEventListener('keydown', e => {
+  if (exporting) return;
+  if (e.code === 'Space') { e.preventDefault(); if (bgm.paused) play(); else { bgm.pause(); manualT = bgm.currentTime; } }
+  else if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+    const d = e.code === 'ArrowRight' ? 5 : -5;
+    if (bgm.paused) manualT = clamp(manualT + d, 0, DUR); else bgm.currentTime = clamp(bgm.currentTime + d, 0, DUR);
+  }
+  else if (e.code === 'KeyF') { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); }
+  else if (e.code === 'Escape') { bgm.pause(); manualT = bgm.currentTime; panel.classList.remove('hide'); }
+});
+
+// ============================================================
+//  导出 MP4：WebCodecs 逐帧离线渲染（默认 4K 60fps），音画严格同步
+// ============================================================
+function loadScript(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+async function pickVideoCodec(w, h, fps, bitrate) {
+  // H.264 level 5.2 可到 4K60；不支持时依次退到 HEVC / AV1 / VP9
+  const cands = [['avc', 'avc1.640034'], ['avc', 'avc1.640033'], ['hevc', 'hvc1.1.6.L153.B0'], ['av1', 'av01.0.12M.08'], ['vp9', 'vp09.00.51.08']];
+  for (const [mux, codec] of cands) {
+    const cfg = { codec, width: w, height: h, bitrate, framerate: fps };
+    try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) return { mux, cfg }; } catch {}
+  }
+  return null;
+}
+async function exportMP4(fps = CONFIG.exportFps, scale = CONFIG.exportScale, dur = DUR) {
+  if (!('VideoEncoder' in window)) { statusEl.textContent = '当前浏览器不支持 WebCodecs，请用最新版 Chrome / Edge'; return; }
+  if (!window.Mp4Muxer) {
+    statusEl.textContent = '加载封装库…';
+    try { await loadScript('https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.min.js'); }
+    catch { await loadScript('https://unpkg.com/mp4-muxer@5.1.3/build/mp4-muxer.min.js'); }
+  }
+  const vw = W * scale, vh = H * scale, bitrate = Math.round(vw * vh * fps * .09); // 4K60 ≈ 45 Mbps
+  const vc = await pickVideoCodec(vw, vh, fps, bitrate);
+  if (!vc) { statusEl.textContent = `编码器不支持 ${vw}×${vh}@${fps}，试试 ?scale=1`; return; }
+  exporting = true; bgm.pause(); playBtn.disabled = expBtn.disabled = true; setScale(scale);
+  try {
+    const sr = AB.sampleRate, ch = Math.min(2, AB.numberOfChannels);
+    let acodec = 'aac', acfg = { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch, bitrate: 192000 };
+    if (!(await AudioEncoder.isConfigSupported(acfg)).supported) { acodec = 'opus'; acfg = { codec: 'opus', sampleRate: sr, numberOfChannels: ch, bitrate: 192000 }; }
+    const muxer = new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(), fastStart: 'in-memory', firstTimestampBehavior: 'offset',
+      video: { codec: vc.mux, width: vw, height: vh, frameRate: fps }, audio: { codec: acodec, numberOfChannels: ch, sampleRate: sr } });
+    let encErr = null;
+    const ve = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: e => { encErr = e; } }); ve.configure(vc.cfg);
+    const ae = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => { encErr = e; } }); ae.configure(acfg);
+    const totalS = Math.floor(dur * sr), CHUNK = 4096, chans = [...Array(ch)].map((_, c) => AB.getChannelData(c));
+    let aOff = 0;
+    const pushAudioUntil = sec => {
+      const until = Math.min(totalS, Math.floor(sec * sr));
+      while (aOff < until) {
+        const n = Math.min(CHUNK, totalS - aOff), data = new Float32Array(n * ch);
+        for (let c = 0; c < ch; c++) for (let i = 0; i < n; i++) data[c * n + i] = chans[c][aOff + i] * (1 - seg((aOff + i) / sr, dur - 2, dur) * .95);
+        ae.encode(new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: n, numberOfChannels: ch, timestamp: Math.round(aOff / sr * 1e6), data }));
+        aOff += n;
+      }
+    };
+    const frames = Math.round(dur * fps), t0 = performance.now();
+    for (let i = 0; i < frames; i++) {
+      if (encErr) throw encErr;
+      const t = i / fps; render(t); pushAudioUntil(t + 1);
+      const vf = new VideoFrame(canvas, { timestamp: Math.round(i * 1e6 / fps), duration: Math.round(1e6 / fps) });
+      ve.encode(vf, { keyFrame: i % (fps * 2) === 0 }); vf.close();
+      if (ve.encodeQueueSize > 4) await new Promise(r => ve.addEventListener('dequeue', r, { once: true }));
+      if (i % 20 === 0) {
+        const el = (performance.now() - t0) / 1000;
+        statusEl.textContent = `导出中 ${(i / frames * 100).toFixed(1)}% · 剩余约 ${Math.ceil(el / (i + 1) * (frames - i - 1))} 秒（保持此标签页在前台）`;
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+    pushAudioUntil(dur + 1);
+    await ve.flush(); await ae.flush(); muxer.finalize();
+    const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' }), a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = `${CONFIG.title}_${vw}x${vh}_${fps}fps.mp4`; a.click();
+    statusEl.textContent = `导出完成：${(blob.size / 1048576).toFixed(1)} MB · ${vc.cfg.codec} + ${acodec.toUpperCase()}`;
+  } finally {
+    setScale(1); exporting = false; playBtn.disabled = expBtn.disabled = false;
+  }
+}
+const exportClick = () => exportMP4(parseInt(qs.get('fps') || CONFIG.exportFps), parseFloat(qs.get('scale') || CONFIG.exportScale))
+  .catch(e => { statusEl.textContent = '导出失败：' + e.message; });
+
+// ============================================================
+//  启动：等字体 + 解码音频（file:// 打开时退化为手动选择 bgm）
+// ============================================================
+(async () => {
+  const allText = CAPS.map(c => c.lines.flat().map(o => o.ch).join('')).join('') + LABELS.map(l => l[3]).join('') +
+    CONFIG.title + '停下再等等下一个人比之前所有人都好?0123456789%';
+  statusEl.textContent = '加载字体与音乐…';
+  const fontLoads = ['900 40px "Noto Sans SC"', '700 40px "Noto Sans SC"', '400 40px "Noto Sans SC"', '900 40px "Noto Serif SC"', '500 40px "Cormorant Garamond"', 'italic 500 40px "Cormorant Garamond"']
+    .map(f => document.fonts.load(f, allText + 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'));
+  await Promise.race([Promise.all(fontLoads), new Promise(r => setTimeout(r, 6000))]);
+  const expLabel = `导出 MP4（${W * CONFIG.exportScale}×${H * CONFIG.exportScale} · ${CONFIG.exportFps}fps）`;
+  const useAudio = async buf => {
+    AB = await new AudioContext({ sampleRate: 48000 }).decodeAudioData(buf); buildEnvelope(AB);
+    expBtn.disabled = false; expBtn.textContent = expLabel; expBtn.onclick = exportClick;
+  };
+  try { await useAudio(await (await fetch('bgm.mp4')).arrayBuffer()); statusEl.textContent = ''; }
+  catch (e) {
+    const pick = document.createElement('input'); pick.type = 'file'; pick.accept = 'audio/*,video/mp4';
+    pick.onchange = async () => {
+      const f = pick.files[0]; if (!f) return; statusEl.textContent = '解析音频…';
+      try { await useAudio(await f.arrayBuffer()); statusEl.textContent = '音频已就绪，可以导出了'; } catch (err) { statusEl.textContent = '音频解析失败：' + err.message; }
+    };
+    expBtn.disabled = false; expBtn.textContent = '选择 bgm.mp4 以启用导出'; expBtn.onclick = () => pick.click();
+    statusEl.textContent = '你是双击打开的，浏览器不允许自动读取音乐。点上面按钮选一下同目录的 bgm.mp4，或双击 start.bat';
+  }
+  playBtn.disabled = false; playBtn.textContent = '▶  播放';
+  if (qs.has('hide')) panel.classList.add('hide');
+  loop();
+})();
+
+// ---------- 调试：逐帧检查（控制台调用 sheet([1, 5, 9, 13]) 生成 2×2 帧拼图） ----------
+window.sheet = times => {
+  exporting = true; let s = document.getElementById('sheet');
+  if (!s) { s = document.createElement('canvas'); s.id = 'sheet'; s.style.cssText = 'position:fixed;inset:0;z-index:99;width:100vw;height:100vh;object-fit:contain;background:#222'; document.body.appendChild(s); }
+  s.width = W; s.height = H; const g = s.getContext('2d'); g.fillStyle = '#222'; g.fillRect(0, 0, W, H);
+  times.forEach((t, i) => { render(t); g.drawImage(canvas, (i % 2) * 960, Math.floor(i / 2) * 540, 956, 536); g.fillStyle = '#0f0'; g.font = 'bold 28px sans-serif'; g.fillText(t.toFixed(2), (i % 2) * 960 + 10, Math.floor(i / 2) * 540 + 34); });
+  return s;
+};
+// 把拼图发到 frame_sink.py（http://127.0.0.1:8799）存成 jpg，方便在终端里用 Read 查看
+window.dump = async (name, times) => (await fetch('http://127.0.0.1:8799/' + name, { method: 'POST', body: sheet(times).toDataURL('image/jpeg', .85) })).text();
+</script>
+</body>
+</html>
